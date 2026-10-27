@@ -128,6 +128,19 @@ def addr_of_topic(t: str) -> str:
     return "0x" + t[26:] if isinstance(t, str) and len(t) == 66 else t
 
 
+def hexint(v) -> int | None:
+    """Some RPCs answer 0x for zero balances; int('0x') would crash."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    if not v or v == "0x":
+        return 0
+    try:
+        return int(v, 16)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------- verify
 
 def cmd_verify(chain: str, wallet: str) -> dict:
@@ -140,10 +153,10 @@ def cmd_verify(chain: str, wallet: str) -> dict:
     code = rpc(url, "eth_getCode", [wallet, "latest"])
     out = {
         "chain": chain, "wallet": wallet,
-        "usdc_balance": (int(bal["result"], 16) / 1e6
-                         if bal.get("result") else None),
-        "native_balance_wei": int(eth["result"], 16) if eth.get("result") else None,
-        "nonce": int(nonce["result"], 16) if nonce.get("result") else None,
+        "usdc_balance": ((hexint(bal.get("result")) or 0) / 1e6
+                         if bal.get("result") is not None else None),
+        "native_balance_wei": hexint(eth.get("result")),
+        "nonce": hexint(nonce.get("result")),
         "is_contract": bool(code.get("result") and code["result"] != "0x"),
     }
     active = bool(out["nonce"] or out["is_contract"] or out["native_balance_wei"]
