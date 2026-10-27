@@ -195,17 +195,16 @@ def cmd_scan(chain: str, wallet: str, days: int, direction: str,
     start = lat - int(days * BLOCKS_PER_DAY[chain])
     start = max(start, 1)
 
-    # Choose chunk size from the first trusted endpoint that accepts probing.
-    chunk = min(sz for _, sz, _ in pools[:1]) if pools else 1000
-    for _, sz, _ in pools:
-        probe = rpc(pools[0][0], "eth_getLogs",
+    # Choose chunk size by probing each (url, max_range) pair with its own url.
+    chunk = 1000
+    for url, sz, _ in pools:
+        probe = rpc(url, "eth_getLogs",
                     [{"address": TOKENS[chain][token], "topics": topics,
                       "fromBlock": hex(lat - 5000),
                       "toBlock": hex(lat - 5000 + sz - 1)}])
         if "result" in probe:
             chunk = sz
             break
-        pools.append(pools.pop(0))  # rotate on failure
 
     token_addr = TOKENS[chain][token]
     chunks: list[list[int]] = []
@@ -222,14 +221,13 @@ def cmd_scan(chain: str, wallet: str, days: int, direction: str,
         res = rpc(url, "eth_getLogs",
                   [{"address": token_addr, "topics": topics,
                     "fromBlock": hex(fb), "toBlock": hex(tb)}], timeout=20)
+        time.sleep(pace)          # stay under public-endpoint rate limits
         if "error" in res:
-            # rate limit / blocked — rotate endpoint instead of advancing
+            # rate limit / blocked — rotate endpoint and slow down
             pools.append(pools.pop(0))
-            if (idx % 40) == 0:
-                print(f"  ...{idx}/{len(chunks)} "
-                      f"({len(events)} events, {time.time()-t0:.0f}s)",
-                      file=sys.stderr)
+            pace = min(pace * 1.5, 1.5)
             continue
+        pace = max(pace / 1.15, 0.05)  # gently recover when the node allows
         idx += 1
         covered += 1
         for l in res["result"]:
