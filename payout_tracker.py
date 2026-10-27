@@ -182,7 +182,6 @@ def cmd_scan(chain: str, wallet: str, days: int, direction: str,
     missing: list[list[int]] = []
 
     # Pacing: rotate endpoints, honour the tightest per-endpoint log cap.
-    buf: list[bytes] = []
     print(f"scanning {chain} last {days}d of USDC {direction}:{wallet}",
           file=sys.stderr)
 
@@ -216,33 +215,47 @@ def cmd_scan(chain: str, wallet: str, days: int, direction: str,
     idx = 0
     t0 = time.time()
     while idx < len(chunks):
-        url, _sz, arch = pools[idx % len(pools)]
         fb, tb = chunks[idx]
-        res = rpc(url, "eth_getLogs",
-                  [{"address": token_addr, "topics": topics,
-                    "fromBlock": hex(fb), "toBlock": hex(tb)}], timeout=20)
-        time.sleep(pace)          # stay under public-endpoint rate limits
-        if "error" in res:
-            # rate limit / blocked — rotate endpoint and slow down
-            pools.append(pools.pop(0))
-            pace = min(pace * 1.5, 1.5)
-            continue
-        pace = max(pace / 1.15, 0.05)  # gently recover when the node allows
-        idx += 1
-        covered += 1
-        for l in res["result"]:
-            if len(l.get("topics", [])) < 3:
-                continue
-            events.append({
-                "block": int(l["blockNumber"], 16),
-                "from": addr_of_topic(l["topics"][1]),
-                "to": addr_of_topic(l["topics"][2]),
-                "value": int(l["data"], 16) / 10 ** DECIMALS[token],
-                "tx": l["transactionHash"],
-            })
+        done = False
+        for url, maxsz, _arch in pools:
+            if maxsz < (tb - fb + 1):
+                # small endpoint: split this chunk for it and try only those
+                sub = [[f, min(f + maxsz - 1, tb)]
+                       for f in range(fb, tb + 1, maxsz)]
+            else:
+                sub = [[fb, tb]]
+            ok = True
+            for f, t in sub:
+                res = rpc(url, "eth_getLogs",
+                          [{"address": token_addr, "topics": topics,
+                            "fromBlock": hex(f), "toBlock": hex(t)}],
+                          timeout=20)
+                time.sleep(pace)
+                if "error" in res:
+                    ok = False
+                    break
+                for l in res["result"]:
+                    if len(l.get("topics", [])) < 3:
+                        continue
+                    events.append({
+                        "block": int(l["blockNumber"], 16),
+                        "from": addr_of_topic(l["topics"][1]),
+                        "to": addr_of_topic(l["topics"][2]),
+                        "value": int(l["data"], 16) / 10 ** DECIMALS[token],
+                        "tx": l["transactionHash"],
+                    })
+            if ok:
+                idx += 1
+                covered += 1
+                pace = max(pace / 1.25, 0.35)     # recover slowly
+                break
+            pace = min(pace * 1.6, 4.0)           # back off hard on failure
+        else:
+            # all endpoints failed this chunk — do not spin hot; log it
+            missing.append([fb, tb])
         if (idx % 200) == 0:
-            print(f"  ...{idx}/{len(chunks)} ({len(events)} events)",
-                  file=sys.stderr)
+            print(f"  ...{idx}/{len(chunks)} ({len(events)} events, "
+                  f"{time.time()-t0:.0f}s, pace={pace:.2f})", file=sys.stderr)
     events.sort(key=lambda e: e["block"])
 
     agg: dict[str, dict] = {}
@@ -262,7 +275,9 @@ def cmd_scan(chain: str, wallet: str, days: int, direction: str,
         "direction": direction, "days": days,
         "window_blocks": [start, lat],
         "coverage": {"chunks_ok": covered, "chunks_total": len(chunks),
-                     "note": "failed chunks retried/rotated until success"},
+                     "missing_chunks": missing,
+                     "note": "failed chunks are retried with backoff; "
+                             "any listed missing range was never covered"},
         "n_events": len(events),
         "sum_events": round(sum(e["value"] for e in events), 6),
         "peers": agg,
